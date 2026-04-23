@@ -1,0 +1,22 @@
+# --- AI / Orchestration ---
+anthropic
+python-dotenv
+
+# --- Google APIs ---
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# --- HTTP & Scraping core ---
+requests
+httpx                   # async-capable alternative to requests
+beautifulsoup4
+lxml
+playwright              # JS-rendered pages (run: playwright install)
+
+# --- Data handling ---
+openpyxl
+pandas
+
+# --- Captcha solving ---
+2captcha-python         # set API_KEY_SOLVER_CAPTCHA in .env
