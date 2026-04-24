@@ -6,6 +6,7 @@ python-dotenv
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
+gspread                 # OOP Google Sheets client (used by tools/utils/google_sheets_manager.py)
 
 # --- HTTP & Scraping core ---
 requests
