@@ -13,7 +13,8 @@ requests
 httpx                   # async-capable alternative to requests
 beautifulsoup4
 lxml
-playwright              # JS-rendered pages (run: playwright install)
+playwright              # JS-rendered pages (run after install: playwright install chromium)
+playwright-stealth      # Patches navigator.webdriver + fingerprint signals
 
 # --- Data handling ---
 openpyxl
