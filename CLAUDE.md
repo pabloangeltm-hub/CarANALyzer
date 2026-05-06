@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+@AGENTS.md
+
 ## Project Overview
 
 Agartha is a **WAT framework** (Workflows, Agents, Tools) — an AI automation architecture that separates probabilistic reasoning (AI agents) from deterministic execution (Python scripts). This separation is what makes the system reliable: each step in a chain stays at near-100% accuracy because AI handles only orchestration, not implementation.

@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block content %}
+
+<!-- ── Filtros ─────────────────────────────────────────────────────── -->
+<form method="get" class="row g-2 mb-4 align-items-end">
+  <div class="col-auto">
+    <label class="form-label fw-semibold mb-1">ROI neto mínimo (%)</label>
+    <input
+      type="number" name="min_roi" class="form-control" style="width:120px"
+      value="{{ min_roi }}" min="0" step="0.5" placeholder="0"
+    >
+  </div>
+  <div class="col-auto">
+    <label class="form-label fw-semibold mb-1">Marca</label>
+    <input
+      type="text" name="brand" class="form-control" style="width:160px"
+      value="{{ brand }}" placeholder="BMW, Audi…"
+    >
+  </div>
+  <div class="col-auto">
+    <label class="form-label fw-semibold mb-1">Estado forense</label>
+    <select name="forensic_status" class="form-select" style="width:180px">
+      <option value="all" {% if forensic_status == 'all' %}selected{% endif %}>Todos</option>
+      {% for s in statuses %}
+      <option value="{{ s }}" {% if forensic_status == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <button type="submit" class="btn btn-primary">Filtrar</button>
+    <a href="/" class="btn btn-outline-secondary ms-1">Reset</a>
+  </div>
+</form>
+
+<!-- ── Resumen ──────────────────────────────────────────────────────── -->
+<p class="text-muted small mb-2">
+  {{ total }} resultado{{ 's' if total != 1 else '' }} —
+  página {{ page }} de {{ total_pages }}
+</p>
+
+<!-- ── Tabla ───────────────────────────────────────────────────────── -->
+{% if listings %}
+<div class="table-responsive">
+  <table class="table table-bordered table-hover table-sm align-middle">
+    <thead class="table-dark">
+      <tr>
+        <th>Portal</th>
+        <th>Marca</th>
+        <th>Modelo</th>
+        <th>Año</th>
+        <th>Km</th>
+        <th>Precio €</th>
+        <th>Mercado €</th>
+        <th>ROI Neto %</th>
+        <th>Estado</th>
+        <th>Link</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for car in listings %}
+      {% set roi = car.roi_neto | float %}
+      <tr class="{% if roi > 15 %}table-roi-hot{% elif roi > 5 %}table-roi-warm{% endif %}">
+        <td>{{ car.portal or '—' }}</td>
+        <td>{{ car.brand or '—' }}</td>
+        <td>{{ car.model or '—' }}</td>
+        <td>{{ car.year or '—' }}</td>
+        <td>{{ '{:,.0f}'.format(car.mileage) if car.mileage else '—' }}</td>
+        <td>{{ '{:,.0f}'.format(car.price) if car.price else '—' }}</td>
+        <td>{{ '{:,.0f}'.format(car.market_price) if car.market_price else '—' }}</td>
+        <td class="fw-bold">{{ '%.1f'|format(roi) }}%</td>
+        <td>
+          {% if car.forensic_status %}
+            <span class="badge
+              {% if car.forensic_status == 'clean' %}bg-success
+              {% elif car.forensic_status == 'repairable' %}bg-warning text-dark
+              {% else %}bg-secondary{% endif %}
+            ">{{ car.forensic_status }}</span>
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if car.url %}
+            <a href="{{ car.url }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline-primary">Ver</a>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- ── Paginación ──────────────────────────────────────────────────── -->
+{% if total_pages > 1 %}
+<nav>
+  <ul class="pagination pagination-sm">
+    {% if page > 1 %}
+    <li class="page-item">
+      <a class="page-link" href="?min_roi={{ min_roi }}&brand={{ brand }}&forensic_status={{ forensic_status }}&page={{ page - 1 }}">‹ Anterior</a>
+    </li>
+    {% endif %}
+    {% for p in range(1, total_pages + 1) %}
+    <li class="page-item {% if p == page %}active{% endif %}">
+      <a class="page-link" href="?min_roi={{ min_roi }}&brand={{ brand }}&forensic_status={{ forensic_status }}&page={{ p }}">{{ p }}</a>
+    </li>
+    {% endfor %}
+    {% if page < total_pages %}
+    <li class="page-item">
+      <a class="page-link" href="?min_roi={{ min_roi }}&brand={{ brand }}&forensic_status={{ forensic_status }}&page={{ page + 1 }}">Siguiente ›</a>
+    </li>
+    {% endif %}
+  </ul>
+</nav>
+{% endif %}
+
+{% else %}
+<div class="alert alert-info">
+  No hay resultados con los filtros actuales.
+  {% if not listings and total == 0 and page == 1 and min_roi == 0 and not brand %}
+  La base de datos está vacía o todavía no se ha ejecutado el pipeline de scraping.
+  {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}

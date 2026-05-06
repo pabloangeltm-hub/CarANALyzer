@@ -1,5 +1,5 @@
 # --- AI / Orchestration ---
-anthropic
+ollama                  # local inference via Ollama (localhost:11434)
 python-dotenv
 
 # --- Google APIs ---
@@ -11,6 +11,7 @@ gspread                 # OOP Google Sheets client (used by tools/utils/google_s
 # --- HTTP & Scraping core ---
 requests
 httpx                   # async-capable alternative to requests
+aiohttp                 # async HTTP client (tools/telegram_notifier.py)
 beautifulsoup4
 lxml
 playwright              # JS-rendered pages (run after install: playwright install chromium)
@@ -22,3 +23,8 @@ pandas
 
 # --- Captcha solving ---
 2captcha-python         # set API_KEY_SOLVER_CAPTCHA in .env
+
+# --- Web (catalog_app) ---
+fastapi
+"uvicorn[standard]"
+jinja2

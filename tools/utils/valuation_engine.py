@@ -121,7 +121,7 @@ class ValuationEngine:
     MAX_FACTOR_DELTA Hard cap on total mileage correction (0.15 = ±15 %).
     """
 
-    MIN_SAMPLE: int = 8
+    MIN_SAMPLE: int = 2
     TRIM_PERCENT: float = 0.10
     MILEAGE_STEP_KM: float = 10_000.0
     PENALTY_PER_STEP: float = 0.005   # 0.5 % per 10 000 km above/below mean
