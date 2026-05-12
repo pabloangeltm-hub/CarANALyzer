@@ -2,7 +2,7 @@
 CarANALyzer — 24/7 Radar orchestrator.
 
 Execution flow (see workflows/car_arbitrage_analysis.md for the full SOP):
-    1. Scrape Milanuncios listings  (Playwright + stealth, ≤ BURST_MAX_PAGES per burst)
+    1. Scrape Milanuncios + Wallapop listings concurrently  (<= BURST_MAX_PAGES per portal)
     2. Group by brand/model/year → compute market valuation per car (ValuationEngine)
     3. Write every analysed car to Google Sheets  (CRM)
     4. Fire Telegram alert for every car with ROI >= ROI_ALERT_THRESHOLD %
@@ -21,12 +21,14 @@ import asyncio
 import html
 import json
 import os
+import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 
 from dotenv import load_dotenv
 
-from tools.scrape_cars import MilanunciosScraper
+from tools.scrape_cars import MilanunciosScraper, WallapopScraper
 from tools.utils.valuation_engine import ValuationEngine, InsufficientDataError
 from tools.utils.forensic_agent import ForensicAgent, analyze_batch
 from tools.utils.telegram_notifier import TelegramNotifier
@@ -45,6 +47,209 @@ SHEETS_TAB: str = "Oportunidades"
 BURST_MAX_PAGES: int = 10             # hard cap per burst — Datadome IP limit
 COOLDOWN_SECONDS: int = 900           # 15 min between bursts
 LAST_SEEN_FILE: str = ".tmp/last_seen_ids.json"
+
+
+# ---------------------------------------------------------------------------
+# Heuristic pre-filter configuration
+# ---------------------------------------------------------------------------
+
+_EMPTY_ENV_VALUES = {"", "any", "all", "*", "none", "null"}
+
+
+@dataclass(frozen=True)
+class HeuristicFilterConfig:
+    year_min: int | None = None
+    year_max: int | None = None
+    price_min: float | None = None
+    price_max: float | None = None
+    seller_types: frozenset[str] = frozenset()
+
+    @property
+    def enabled(self) -> bool:
+        return any(
+            value is not None
+            for value in (self.year_min, self.year_max, self.price_min, self.price_max)
+        ) or bool(self.seller_types)
+
+    def summary(self) -> str:
+        parts: list[str] = []
+        if self.year_min is not None or self.year_max is not None:
+            parts.append(f"year={self.year_min or '*'}..{self.year_max or '*'}")
+        if self.price_min is not None or self.price_max is not None:
+            price_min = f"{self.price_min:.0f}" if self.price_min is not None else "*"
+            price_max = f"{self.price_max:.0f}" if self.price_max is not None else "*"
+            parts.append(f"price={price_min}..{price_max}")
+        if self.seller_types:
+            parts.append(f"seller_type={','.join(sorted(self.seller_types))}")
+        return "; ".join(parts) if parts else "disabled"
+
+
+def _env_first(*names: str) -> str:
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw.lower() not in _EMPTY_ENV_VALUES:
+            return raw
+    return ""
+
+
+def _parse_int(raw: str, label: str, warnings: list[str]) -> int | None:
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        warnings.append(f"{label}={raw!r} is not an integer; ignored")
+        return None
+
+
+def _parse_price(raw: str, label: str, warnings: list[str]) -> float | None:
+    if not raw:
+        return None
+    cleaned = raw.replace("EUR", "").replace("eur", "").replace("€", "").strip()
+    cleaned = cleaned.replace(".", "").replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError:
+        warnings.append(f"{label}={raw!r} is not a price; ignored")
+        return None
+
+
+def _parse_price_band(raw: str, warnings: list[str]) -> tuple[float | None, float | None]:
+    if not raw:
+        return None, None
+    parts = [part.strip() for part in re.split(r"[:|,-]", raw, maxsplit=1)]
+    if len(parts) != 2:
+        warnings.append(
+            f"AGARTHA_PREFILTER_PRICE_BAND={raw!r} must look like 'min:max'; ignored"
+        )
+        return None, None
+    return (
+        _parse_price(parts[0], "AGARTHA_PREFILTER_PRICE_BAND.min", warnings),
+        _parse_price(parts[1], "AGARTHA_PREFILTER_PRICE_BAND.max", warnings),
+    )
+
+
+def _normalize_seller_type(value: object) -> str | None:
+    raw = str(value or "").strip().lower()
+    if raw in _EMPTY_ENV_VALUES:
+        return None
+    aliases = {
+        "particular": "private",
+        "particulares": "private",
+        "private": "private",
+        "privado": "private",
+        "profesional": "professional",
+        "professional": "professional",
+        "dealer": "professional",
+        "business": "professional",
+        "empresa": "professional",
+    }
+    return aliases.get(raw, raw)
+
+
+def load_heuristic_filter_config() -> tuple[HeuristicFilterConfig, list[str]]:
+    """Load optional pre-filter settings from .env-compatible variables."""
+    warnings: list[str] = []
+
+    year_min = _parse_int(
+        _env_first("AGARTHA_PREFILTER_YEAR_MIN", "YEAR_MIN"),
+        "AGARTHA_PREFILTER_YEAR_MIN",
+        warnings,
+    )
+    year_max = _parse_int(
+        _env_first("AGARTHA_PREFILTER_YEAR_MAX", "YEAR_MAX"),
+        "AGARTHA_PREFILTER_YEAR_MAX",
+        warnings,
+    )
+    price_min, price_max = _parse_price_band(
+        _env_first("AGARTHA_PREFILTER_PRICE_BAND", "PRICE_BAND"),
+        warnings,
+    )
+    explicit_price_min = _parse_price(
+        _env_first("AGARTHA_PREFILTER_PRICE_MIN", "PRICE_MIN"),
+        "AGARTHA_PREFILTER_PRICE_MIN",
+        warnings,
+    )
+    explicit_price_max = _parse_price(
+        _env_first("AGARTHA_PREFILTER_PRICE_MAX", "PRICE_MAX"),
+        "AGARTHA_PREFILTER_PRICE_MAX",
+        warnings,
+    )
+    price_min = explicit_price_min if explicit_price_min is not None else price_min
+    price_max = explicit_price_max if explicit_price_max is not None else price_max
+
+    seller_raw = _env_first("AGARTHA_PREFILTER_SELLER_TYPE", "SELLER_TYPE")
+    seller_types = frozenset(
+        normalized
+        for part in re.split(r"[,;|]", seller_raw)
+        if (normalized := _normalize_seller_type(part))
+    )
+
+    if year_min is not None and year_max is not None and year_min > year_max:
+        warnings.append("AGARTHA_PREFILTER_YEAR_MIN is greater than YEAR_MAX; swapping")
+        year_min, year_max = year_max, year_min
+    if price_min is not None and price_max is not None and price_min > price_max:
+        warnings.append("AGARTHA_PREFILTER_PRICE_MIN is greater than PRICE_MAX; swapping")
+        price_min, price_max = price_max, price_min
+
+    return (
+        HeuristicFilterConfig(
+            year_min=year_min,
+            year_max=year_max,
+            price_min=price_min,
+            price_max=price_max,
+            seller_types=seller_types,
+        ),
+        warnings,
+    )
+
+
+def _heuristic_reject_reason(car: dict, config: HeuristicFilterConfig) -> str | None:
+    price = car.get("price")
+    year = car.get("year")
+
+    if config.price_min is not None or config.price_max is not None:
+        if price is None:
+            return "missing_price"
+        if config.price_min is not None and price < config.price_min:
+            return "price_below_min"
+        if config.price_max is not None and price > config.price_max:
+            return "price_above_max"
+
+    if config.year_min is not None or config.year_max is not None:
+        if year is None:
+            return "missing_year"
+        if config.year_min is not None and year < config.year_min:
+            return "year_below_min"
+        if config.year_max is not None and year > config.year_max:
+            return "year_above_max"
+
+    if config.seller_types:
+        seller_type = _normalize_seller_type(car.get("seller_type"))
+        if seller_type is None:
+            return "missing_seller_type"
+        if seller_type not in config.seller_types:
+            return "seller_type_mismatch"
+
+    return None
+
+
+def apply_heuristic_prefilter(
+    listings: list[dict],
+    config: HeuristicFilterConfig,
+) -> tuple[list[dict], dict[str, int]]:
+    if not config.enabled:
+        return listings, {}
+
+    kept: list[dict] = []
+    rejected: dict[str, int] = defaultdict(int)
+    for car in listings:
+        reason = _heuristic_reject_reason(car, config)
+        if reason is None:
+            kept.append(car)
+        else:
+            rejected[reason] += 1
+    return kept, dict(rejected)
 
 
 # ---------------------------------------------------------------------------
@@ -134,20 +339,49 @@ async def _run_pipeline(
     notifier = TelegramNotifier()
 
     # ── Step 1: Scrape ──────────────────────────────────────────────────────
-    print("\n[1/5] Scraping Milanuncios...")
-    scraper = MilanunciosScraper()
-    try:
-        listings = await scraper.scrape(
-            MilanunciosScraper.BASE_URL,
-            max_pages=max_pages,
-            seen_ids=seen_ids,
-            start_page=start_page,
-            disable_brake=disable_brake,
+    print("\n[1/5] Scraping Milanuncios + Wallapop concurrently...")
+
+    async def _scrape_portal(
+        portal: str,
+        scraper,
+        url: str | None,
+    ) -> tuple[str, list[dict], str | None]:
+        try:
+            results = await scraper.scrape(
+                url,
+                max_pages=max_pages,
+                seen_ids=seen_ids,
+                start_page=start_page,
+                disable_brake=disable_brake,
+            )
+            return portal, results, None
+        except Exception as exc:
+            return portal, [], str(exc)
+
+    scrape_results = await asyncio.gather(
+        _scrape_portal("milanuncios", MilanunciosScraper(), MilanunciosScraper.BASE_URL),
+        _scrape_portal("wallapop", WallapopScraper(), None),
+    )
+
+    listings: list[dict] = []
+    failures: list[str] = []
+    for portal, portal_listings, error in scrape_results:
+        if error:
+            failures.append(f"{portal}: {error}")
+            print(f"[ERROR] {portal} scraping failed: {error}")
+            continue
+        listings.extend(portal_listings)
+        print(f"      {portal}: {len(portal_listings)} listing(s)")
+
+    if failures:
+        message = "CarANALyzer scraping partial failure:\n" + "\n".join(
+            f"<code>{html.escape(failure)}</code>" for failure in failures
         )
-    except Exception as exc:
-        print(f"[ERROR] Scraping failed: {exc}")
-        notifier.send_text(f"CarANALyzer — scraping failed:\n<code>{html.escape(str(exc))}</code>")
-        return set()
+        if not listings:
+            print("[ERROR] All scraping portals failed.")
+            notifier.send_text(message)
+            return set()
+        notifier.send_text(message)
 
     if not listings:
         print("[INFO] No new listings this burst.")
@@ -155,6 +389,25 @@ async def _run_pipeline(
 
     burst_ids = {car["ad_id"] for car in listings if car.get("ad_id")}
     print(f"      {len(listings)} new listing(s) | {len(burst_ids)} unique ID(s).")
+
+    filter_config, filter_warnings = load_heuristic_filter_config()
+    for warning in filter_warnings:
+        print(f"[WARN] Heuristic pre-filter config: {warning}")
+    if filter_config.enabled:
+        listings, rejected_counts = apply_heuristic_prefilter(listings, filter_config)
+        rejected_total = sum(rejected_counts.values())
+        rejected_summary = ", ".join(
+            f"{reason}={count}" for reason, count in sorted(rejected_counts.items())
+        ) or "none"
+        print(
+            f"      Heuristic pre-filter ({filter_config.summary()}): "
+            f"{len(listings)} kept / {rejected_total} rejected ({rejected_summary})."
+        )
+        if not listings:
+            print("[INFO] No listings match the heuristic pre-filter this burst.")
+            return burst_ids
+    else:
+        print("      Heuristic pre-filter disabled (.env not set).")
 
     # ── Step 1.5: Market catalog update + profitable pre-filter ────────────
     print(f"\n[1.5/5] Updating market catalog and filtering by max bid...")
@@ -256,7 +509,7 @@ async def _run_pipeline(
     # ── Step 4: SQLite CRM ──────────────────────────────────────────────────
     print(f"\n[4/5] Persisting {len(listings)} listing(s) to SQLite...")
     try:
-        db.init_db()
+        await db.init_db()
         analysed_by_id = {r["car"].get("ad_id"): r for r in analysed}
         for car in listings:
             record = analysed_by_id.get(car.get("ad_id"))
@@ -265,7 +518,7 @@ async def _run_pipeline(
                 flat["market_price"] = record["market_price"]
                 flat["roi_bruto"]    = record["roi"]
                 flat["roi_neto"]     = record["roi_neto"]
-            db.upsert_listing(flat)
+            await db.upsert_listing(flat)
         print(f"  [OK] {len(listings)} listing(s) upserted to .tmp/agartha.db")
     except Exception as exc:
         print(f"  [ERROR] SQLite write failed: {exc}")

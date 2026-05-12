@@ -44,6 +44,8 @@ tools/          # Python scripts — deterministic execution layer
 
 **On deliverables:** Final outputs go to cloud services. `.tmp/` is disposable. Never store secrets outside `.env`.
 
+**On technology selection:** Before choosing any library, frontend stack, or external tool, run `/find-skills` to discover relevant installed skills. This applies to: frontend frameworks, Python packages, DevOps tooling, or any dependency decision. Document the skill output in the relevant SOP or coordination note before proceeding.
+
 ## Self-Improvement Loop
 
 When something breaks: identify the failure → fix the tool → verify the fix → update the workflow with the new approach. This is how the framework improves over time.

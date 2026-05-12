@@ -32,26 +32,37 @@ As a module:
 
 import asyncio
 import argparse
+import base64
 import glob
+import hashlib
+import hmac
 import json
 import os
 import random
 import re
 import shutil
 import sys
+import time
+import unicodedata
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 try:
     from tools.telegram_notifier import TelegramNotifier
 except ImportError:
     from telegram_notifier import TelegramNotifier
 
+from bs4 import BeautifulSoup
 import uuid
 import httpx
 from playwright.async_api import async_playwright, Browser, Page
 from playwright_stealth import Stealth
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +358,8 @@ class CarScraper(ABC):
                 continue
         if not values:
             return None
-        # Return the smallest value — rebajado / financiado price is always lower
-        return min(values)
+        car_price_values = [value for value in values if value >= MIN_VALID_PRICE]
+        return min(car_price_values or values)
 
     @staticmethod
     def parse_mileage(raw: str) -> Optional[int]:
@@ -431,6 +442,472 @@ class MilanunciosScraper(CarScraper):
         "button:has-text('Aceptar y cerrar')",
         "button:has-text('Aceptar')",
     ]
+
+    async def scrape(
+        self,
+        url: str,
+        max_pages: int = 3,
+        seen_ids: Optional[set[str]] = None,
+        start_page: int = 1,
+        disable_brake: bool = False,
+    ) -> list[dict]:
+        """
+        Use Scrapling as the default Milanuncios backend.
+
+        Set MILANUNCIOS_SCRAPER_BACKEND=playwright to force the legacy browser
+        path during troubleshooting.
+        """
+        backend = os.getenv("MILANUNCIOS_SCRAPER_BACKEND", "scrapling").strip().lower()
+        if backend in {"playwright", "browser", "legacy"}:
+            print(f"[{self.PORTAL_NAME}] backend=playwright (forced)")
+            return await super().scrape(
+                url,
+                max_pages=max_pages,
+                seen_ids=seen_ids,
+                start_page=start_page,
+                disable_brake=disable_brake,
+            )
+
+        try:
+            return await self._scrape_with_scrapling(
+                url,
+                max_pages=max_pages,
+                seen_ids=seen_ids,
+                start_page=start_page,
+                disable_brake=disable_brake,
+            )
+        except RuntimeError as exc:
+            print(f"[{self.PORTAL_NAME}] Scrapling unavailable ({exc}); falling back to Playwright")
+            return await super().scrape(
+                url,
+                max_pages=max_pages,
+                seen_ids=seen_ids,
+                start_page=start_page,
+                disable_brake=disable_brake,
+            )
+
+    async def _scrape_with_scrapling(
+        self,
+        url: str,
+        max_pages: int,
+        seen_ids: Optional[set[str]],
+        start_page: int,
+        disable_brake: bool,
+    ) -> list[dict]:
+        try:
+            from scrapling.fetchers import StealthyFetcher
+        except ImportError as exc:
+            raise RuntimeError("scrapling[fetchers] is not installed") from exc
+
+        timeout_ms = self._scrapling_timeout_ms()
+        sessions = self._session_pool()
+        results: list[dict] = []
+        seen = set(seen_ids or set())
+        print(
+            f"[{self.PORTAL_NAME}] backend=scrapling timeout={timeout_ms}ms "
+            f"sessions={len(sessions)}"
+        )
+
+        for page_num in range(start_page, start_page + max_pages):
+            os.makedirs(".tmp", exist_ok=True)
+            with open(".tmp/last_page.txt", "w") as _lp:
+                _lp.write(str(page_num))
+
+            rel_page = page_num - start_page + 1
+            current_url = self._paginate_url(url, page_num)
+            session_path = sessions[(page_num - start_page) % len(sessions)] if sessions else None
+            started = time.perf_counter()
+            print(f"[{self.PORTAL_NAME}] page {rel_page}/{max_pages} -> {current_url}")
+
+            try:
+                hard_timeout = max(60.0, (timeout_ms / 1000) + 90.0)
+                response = await asyncio.wait_for(
+                    StealthyFetcher.async_fetch(
+                        current_url,
+                        headless=True,
+                        timeout=timeout_ms,
+                        wait=1_000,
+                        wait_selector=self._SEL_CARD,
+                        wait_selector_state="attached",
+                        locale="es-ES",
+                        timezone_id="Europe/Madrid",
+                        block_webrtc=True,
+                        hide_canvas=True,
+                        google_search=True,
+                        page_action=self._scrapling_page_action,
+                        cookies=self._cookies_from_storage_state(session_path) or None,
+                        useragent=_WINDOWS_UA if session_path else None,
+                        extra_headers={"Accept-Language": "es-ES,es;q=0.9"},
+                    ),
+                    timeout=hard_timeout,
+                )
+            except Exception as exc:
+                print(f"[{self.PORTAL_NAME}] Scrapling page error: {type(exc).__name__}: {exc}")
+                print(f"[{self.PORTAL_NAME}] retrying page through Playwright fallback")
+                return await super().scrape(
+                    url,
+                    max_pages=max_pages,
+                    seen_ids=seen_ids,
+                    start_page=start_page,
+                    disable_brake=disable_brake,
+                )
+
+            body = self._response_body(response)
+            page_listings, cards_count, title = self._extract_scrapling_listings(body)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+
+            if self._looks_blocked(title, cards_count, body):
+                print(
+                    f"[{self.PORTAL_NAME}] Scrapling block signal "
+                    f"(title={title!r}, cards={cards_count}); falling back to Playwright"
+                )
+                return await super().scrape(
+                    url,
+                    max_pages=max_pages,
+                    seen_ids=seen_ids,
+                    start_page=start_page,
+                    disable_brake=disable_brake,
+                )
+
+            if disable_brake:
+                new = page_listings
+                print(
+                    f"[{self.PORTAL_NAME}] page {rel_page}: "
+                    f"{len(page_listings)} extracted (brake disabled, {latency_ms}ms)"
+                )
+            else:
+                new = [listing for listing in page_listings if listing.get("ad_id") not in seen]
+                hit_overlap = len(new) < len(page_listings)
+                print(
+                    f"[{self.PORTAL_NAME}] page {rel_page}: "
+                    f"{len(page_listings)} extracted, {len(new)} new ({latency_ms}ms)"
+                )
+                if hit_overlap:
+                    print(f"[{self.PORTAL_NAME}] known ID detected - incremental brake engaged")
+                    results.extend(new)
+                    break
+
+            results.extend(new)
+            for listing in new:
+                ad_id = listing.get("ad_id")
+                if ad_id:
+                    seen.add(ad_id)
+
+            if rel_page < max_pages:
+                delay = random.uniform(1.0, 2.5)
+                print(f"[{self.PORTAL_NAME}] sleeping {delay:.1f}s before next page...")
+                await asyncio.sleep(delay)
+
+        return results
+
+    @staticmethod
+    def _scrapling_timeout_ms() -> int:
+        raw = os.getenv("MILANUNCIOS_SCRAPLING_TIMEOUT_MS", "45000")
+        try:
+            return max(5_000, int(raw))
+        except ValueError:
+            return 45_000
+
+    @staticmethod
+    def _session_pool() -> list[str]:
+        pool = sorted(glob.glob(f"{_SESSIONS_DIR}/*.json"))
+        random.shuffle(pool)
+        if not pool and os.path.exists(_AUTH_STATE_PATH):
+            pool = [_AUTH_STATE_PATH]
+        return pool
+
+    @staticmethod
+    def _cookies_from_storage_state(path: Optional[str]) -> list[dict[str, Any]]:
+        if not path:
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        cookies = payload.get("cookies", [])
+        return cookies if isinstance(cookies, list) else []
+
+    async def _scrapling_page_action(self, page: Any) -> None:
+        for selector in self._COOKIE_SELECTORS:
+            try:
+                await page.click(selector, timeout=2_000)
+                break
+            except Exception:
+                continue
+
+        scroll_pos = 0
+        for _ in range(80):
+            page_height = await page.evaluate("document.body.scrollHeight")
+            if scroll_pos >= page_height:
+                break
+            scroll_pos = min(scroll_pos + random.randint(260, 420), page_height)
+            await page.evaluate(f"window.scrollTo(0, {scroll_pos});")
+            await asyncio.sleep(random.uniform(0.2, 0.45))
+        await asyncio.sleep(random.uniform(0.8, 1.2))
+
+    @staticmethod
+    def _response_body(response: Any) -> str:
+        for attr in ("html_content", "body", "text", "html"):
+            value = getattr(response, attr, None)
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    continue
+            if isinstance(value, bytes):
+                value = value.decode(
+                    getattr(response, "encoding", None) or "utf-8",
+                    errors="replace",
+                )
+            if isinstance(value, str) and value.strip():
+                return value
+        return str(response)
+
+    @staticmethod
+    def _normalize_key(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        return "".join(ch for ch in normalized.lower() if not unicodedata.combining(ch))
+
+    @classmethod
+    def _tag_value(cls, ad: dict[str, Any], tag_type: str) -> str:
+        expected = cls._normalize_key(tag_type)
+        for tag in ad.get("tags") or []:
+            if not isinstance(tag, dict):
+                continue
+            tag_key = cls._normalize_key(str(tag.get("type") or ""))
+            if tag_key == expected:
+                return str(tag.get("text") or "")
+        return ""
+
+    @staticmethod
+    def _tag_texts(ad: dict[str, Any]) -> list[str]:
+        texts: list[str] = []
+        for tag in ad.get("tags") or []:
+            if isinstance(tag, dict):
+                text = str(tag.get("text") or "").strip()
+                if text:
+                    texts.append(text)
+        return texts
+
+    @staticmethod
+    def _price_from_initial_ad(ad: dict[str, Any]) -> Optional[float]:
+        price = ad.get("price")
+        if not isinstance(price, dict):
+            return None
+
+        values: list[float] = []
+        for key in ("cashPrice", "financedPrice"):
+            price_block = price.get(key)
+            if not isinstance(price_block, dict):
+                continue
+            value = price_block.get("value")
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        return min(values) if values else None
+
+    @staticmethod
+    def _location_from_initial_ad(ad: dict[str, Any]) -> Optional[str]:
+        location = ad.get("location")
+        if not isinstance(location, dict):
+            return None
+
+        city = location.get("city") if isinstance(location.get("city"), dict) else {}
+        province = location.get("province") if isinstance(location.get("province"), dict) else {}
+        parts = [city.get("name"), province.get("name")]
+        return ", ".join(str(part) for part in parts if part)
+
+    @classmethod
+    def _initial_ad_to_listing(cls, ad: dict[str, Any]) -> Optional[dict[str, Any]]:
+        ad_id = str(ad.get("id") or "").strip()
+        title = str(ad.get("title") or "").strip()
+        url = str(ad.get("url") or "").strip()
+        if not ad_id or not title or not url:
+            return None
+
+        listing_url = f"https://www.milanuncios.com{url}" if url.startswith("/") else url
+        price = cls._price_from_initial_ad(ad)
+        if price is not None and price < MIN_VALID_PRICE:
+            return None
+
+        brand, model = cls._split_brand_model(title)
+        tag_texts = cls._tag_texts(ad)
+        year = cls.parse_year(cls._tag_value(ad, "ano")) or cls.parse_year(title)
+        if year is None:
+            year = next((parsed for parsed in (cls.parse_year(text) for text in tag_texts) if parsed), None)
+
+        mileage_raw = cls._tag_value(ad, "kilometros")
+        if not mileage_raw:
+            mileage_raw = next((text for text in tag_texts if "km" in text.lower()), "")
+        mileage = cls.parse_mileage(mileage_raw)
+        images = ad.get("images")
+
+        return {
+            "portal": cls.PORTAL_NAME,
+            "ad_id": ad_id,
+            "brand": brand,
+            "model": model,
+            "year": year,
+            "mileage": mileage,
+            "price": price,
+            "title": title,
+            "description": ad.get("description") or None,
+            "url": listing_url,
+            "seller_type": ad.get("sellerType") or None,
+            "location": cls._location_from_initial_ad(ad),
+            "images_count": len(images) if isinstance(images, list) else None,
+        }
+
+    @staticmethod
+    def _script_json_parse_payload(script_text: str, variable_name: str) -> Optional[dict[str, Any]]:
+        pattern = re.compile(
+            rf"window\.{re.escape(variable_name)}\s*=\s*JSON\.parse\("
+            r"(?P<payload>\"(?:\\.|[^\"\\])*\")\)\s*;?",
+            re.S,
+        )
+        match = pattern.search(script_text)
+        if not match:
+            return None
+        try:
+            raw_json = json.loads(match.group("payload"))
+            payload = json.loads(raw_json)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def _extract_initial_props(cls, soup: BeautifulSoup) -> Optional[dict[str, Any]]:
+        for script in soup.find_all("script"):
+            script_text = script.string or script.get_text() or ""
+            if "window.__INITIAL_PROPS__" not in script_text:
+                continue
+            payload = cls._script_json_parse_payload(script_text, "__INITIAL_PROPS__")
+            if payload:
+                return payload
+        return None
+
+    @classmethod
+    def _extract_initial_prop_listings(cls, soup: BeautifulSoup) -> list[dict[str, Any]]:
+        initial_props = cls._extract_initial_props(soup)
+        if not initial_props:
+            return []
+
+        ad_list = (
+            initial_props.get("adListPagination", {})
+            .get("adList", {})
+            .get("ads", [])
+        )
+        if not isinstance(ad_list, list):
+            return []
+
+        listings: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for ad in ad_list:
+            if not isinstance(ad, dict):
+                continue
+            listing = cls._initial_ad_to_listing(ad)
+            if not listing:
+                continue
+            ad_id = listing["ad_id"]
+            if ad_id in seen:
+                continue
+            seen.add(ad_id)
+            listings.append(listing)
+        return listings
+
+    @staticmethod
+    def _first_text(node: Any, selector: str) -> str:
+        match = node.select_one(selector)
+        return match.get_text(" ", strip=True) if match else ""
+
+    @classmethod
+    def _extract_scrapling_listings(
+        cls,
+        html: str,
+    ) -> tuple[list[dict[str, Any]], int, Optional[str]]:
+        scraper = cls()
+        soup = BeautifulSoup(html, "lxml")
+        title = soup.title.get_text(" ", strip=True) if soup.title else None
+        cards = soup.select(scraper._SEL_CARD)
+
+        initial_listings = cls._extract_initial_prop_listings(soup)
+        if initial_listings:
+            return initial_listings, max(len(cards), len(initial_listings)), title
+
+        listings: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for card in cards:
+            listing = scraper._parse_static_card(card)
+            if not listing:
+                continue
+            ad_id = listing["ad_id"]
+            if ad_id in seen:
+                continue
+            seen.add(ad_id)
+            listings.append(listing)
+
+        return listings, len(cards), title
+
+    def _parse_static_card(self, card: Any) -> Optional[dict[str, Any]]:
+        title = self._first_text(card, self._SEL_TITLE)
+        if not title:
+            return None
+
+        href = ""
+        for selector in (self._SEL_LINK, "a[href^='/']", "a[href]", "a"):
+            link = card.select_one(selector)
+            if link and link.get("href"):
+                href = str(link["href"])
+                break
+        if not href:
+            return None
+
+        listing_url = f"https://www.milanuncios.com{href}" if href.startswith("/") else href
+        ad_id_match = re.search(r"(\d{6,})", listing_url)
+        ad_id = ad_id_match.group(1) if ad_id_match else href.strip("/").replace("/", "-")
+
+        price = self.parse_price(self._first_text(card, self._SEL_PRICE))
+        if price is not None and price < MIN_VALID_PRICE:
+            return None
+
+        tag_texts = [
+            tag.get_text(" ", strip=True)
+            for tag in card.select(self._SEL_TAG_LABELS)
+        ]
+        year = None
+        mileage = None
+        for tag in tag_texts:
+            if year is None:
+                year = self.parse_year(tag)
+            if mileage is None and "km" in tag.lower():
+                mileage = self.parse_mileage(tag)
+        if year is None:
+            year = self.parse_year(title)
+
+        brand, model = self._split_brand_model(title)
+        return {
+            "portal": self.PORTAL_NAME,
+            "ad_id": ad_id,
+            "brand": brand,
+            "model": model,
+            "year": year,
+            "mileage": mileage,
+            "price": price,
+            "title": title,
+            "description": self._first_text(card, self._SEL_DESCRIPTION) or None,
+            "url": listing_url,
+            "seller_type": None,
+        }
+
+    @staticmethod
+    def _looks_blocked(title: Optional[str], cards_count: int, body: str = "") -> bool:
+        title_l = (title or "").lower()
+        body_l = body.lower()
+        if "pardon our interruption" in title_l:
+            return True
+        if "datadome" in body_l and cards_count == 0:
+            return True
+        return cards_count == 0
 
     async def _handle_cookies(self, page: Page) -> None:
         for sel in self._COOKIE_SELECTORS:
@@ -593,6 +1070,7 @@ class MilanunciosScraper(CarScraper):
             "title":       title,
             "description": description,
             "url":         url,
+            "seller_type":  None,
         }
 
     @staticmethod
@@ -626,7 +1104,7 @@ class MilanunciosScraper(CarScraper):
 #   1. GET /api/v3/search/components  →  returns query_params containing search_id
 #   2. GET /api/v3/search/section     →  data.section.items + meta.next_page (JWT cursor)
 #
-# Required headers: x-appversion, x-deviceos, x-deviceid (random UUID per session)
+# Required headers: x-appversion, x-deviceos, x-deviceid, x-signature, x-timestamp
 # ---------------------------------------------------------------------------
 
 class WallapopScraper:
@@ -639,6 +1117,10 @@ class WallapopScraper:
 
     _COMPONENTS_URL = "https://api.wallapop.com/api/v3/search/components"
     _SECTION_URL    = "https://api.wallapop.com/api/v3/search/section"
+    _SIGNATURE_SECRET = (
+        "Tm93IHRoYXQgeW91J3ZlIGZvdW5kIHRoaXMsIGFyZSB5b3UgcmVhZHkgdG8gam9pbiB1cz8gam9ic0B3YWxsYXBvcC5jb20=="
+    )
+    _APP_VERSION = os.getenv("WALLAPOP_APP_VERSION", "820560")
 
     _SEARCH_PARAMS: dict = {
         "source":     "deep_link",
@@ -656,9 +1138,9 @@ class WallapopScraper:
             "accept-language":  "es,es-ES;q=0.9",
             "referer":          "https://es.wallapop.com/",
             "origin":           "https://es.wallapop.com",
-            "x-appversion":     "820140",
+            "x-appversion":     os.getenv("WALLAPOP_APP_VERSION", self._APP_VERSION),
             "x-deviceos":       "0",
-            "x-deviceid":       str(uuid.uuid4()),
+            "x-deviceid":       uuid.uuid4().hex,
             "deviceos":         "0",
             "sec-fetch-dest":   "empty",
             "sec-fetch-mode":   "cors",
@@ -778,7 +1260,9 @@ class WallapopScraper:
         headers = {"accept": accept} if accept else {}
         for attempt in range(self._MAX_RETRY):
             try:
-                resp = await client.get(url, params=params, headers=headers)
+                request = client.build_request("GET", url, params=params, headers=headers)
+                request.headers.update(self._build_signed_headers("GET", request.url))
+                resp = await client.send(request)
                 if resp.status_code == 429:
                     wait = 5 * (2 ** attempt)  # 5s → 10s → 20s
                     print(
@@ -795,6 +1279,46 @@ class WallapopScraper:
                 print(f"[{self.PORTAL_NAME}] request error: {exc}")
             if attempt < self._MAX_RETRY - 1:
                 await asyncio.sleep(2 ** attempt)
+        return None
+
+    def _build_signed_headers(self, method: str, url: "httpx.URL") -> dict[str, str]:
+        timestamp = str(int(time.time()))
+        target = self._signature_target(url)
+        payload = f"{method.upper()}|{target}|{timestamp}|".encode("utf-8")
+        digest = hmac.new(
+            self._SIGNATURE_SECRET.encode("utf-8"),
+            payload,
+            hashlib.sha256,
+        ).digest()
+        return {
+            "x-timestamp": timestamp,
+            "x-signature": base64.b64encode(digest).decode("ascii"),
+        }
+
+    @staticmethod
+    def _signature_target(url: "httpx.URL") -> str:
+        return url.raw_path.decode("utf-8")
+
+    @staticmethod
+    def _seller_type_from_item(item: dict) -> Optional[str]:
+        for key in ("seller_type", "sellerType", "seller_kind", "sellerKind"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        for key in ("is_professional", "professional", "isPro", "pro"):
+            value = item.get(key)
+            if isinstance(value, bool):
+                return "professional" if value else "private"
+
+        for container_key in ("seller", "user", "owner"):
+            container = item.get(container_key)
+            if not isinstance(container, dict):
+                continue
+            nested = WallapopScraper._seller_type_from_item(container)
+            if nested:
+                return nested
+
         return None
 
     def _parse_item(self, item: dict) -> Optional[dict]:
@@ -848,6 +1372,7 @@ class WallapopScraper:
                 "title":       title,
                 "description": description,
                 "url":         listing_url,
+                "seller_type":  self._seller_type_from_item(item),
             }
         except Exception as exc:
             print(f"[{self.PORTAL_NAME}] item parse error (skipping): {exc}")
@@ -912,7 +1437,7 @@ async def run(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Scrape car listings using Playwright + stealth"
+        description="Scrape car listings using Scrapling/Playwright stealth"
     )
     parser.add_argument(
         "--portal",

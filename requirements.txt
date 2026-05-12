@@ -16,8 +16,10 @@ beautifulsoup4
 lxml
 playwright              # JS-rendered pages (run after install: playwright install chromium)
 playwright-stealth      # Patches navigator.webdriver + fingerprint signals
+scrapling[fetchers]     # Stealth fetcher benchmark for Milanuncios Datadome PoC
 
 # --- Data handling ---
+aiosqlite               # async SQLite access + WAL connection pool (tools/utils/db.py)
 openpyxl
 pandas
 
@@ -26,5 +28,15 @@ pandas
 
 # --- Web (catalog_app) ---
 fastapi
-"uvicorn[standard]"
+uvicorn[standard]
+structlog>=25.5.0
+prometheus-client>=0.25.0
 jinja2
+bcrypt
+PyJWT
+stripe>=14.4.0
+resend[async]
+
+# --- Testing ---
+pytest
+pytest-cov

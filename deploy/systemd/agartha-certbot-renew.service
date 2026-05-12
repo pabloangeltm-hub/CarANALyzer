@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew Agartha Let's Encrypt certificates
+Requires=docker.service
+After=docker.service network-online.target agartha.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/agartha
+ExecStart=/usr/bin/docker compose --profile certbot run --rm certbot renew --webroot --webroot-path /var/www/certbot --quiet
+ExecStartPost=/usr/bin/docker compose exec -T nginx nginx -s reload

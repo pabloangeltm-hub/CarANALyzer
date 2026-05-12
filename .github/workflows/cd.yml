@@ -1,0 +1,64 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    branches:
+      - main
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy VPS
+    runs-on: ubuntu-24.04
+    environment: production
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Configure SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          test -n "$VPS_HOST"
+          test -n "$VPS_SSH_KEY"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/agartha_deploy_key
+          chmod 600 ~/.ssh/agartha_deploy_key
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy current main on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+          VPS_USER: ${{ secrets.VPS_USER || 'root' }}
+        run: |
+          ssh -i ~/.ssh/agartha_deploy_key -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" 'bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="/opt/agartha"
+          SERVICE_NAME="agartha.service"
+          SUDO=""
+          if [[ "${EUID}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          fi
+
+          cd "$APP_DIR"
+          git fetch origin main
+          git reset --hard origin/main
+
+          $SUDO docker compose -f docker-compose.yml build
+          $SUDO docker compose -f docker-compose.yml run --rm api \
+            python tools/run_migrations.py --db-path /app/.tmp/agartha.db
+          $SUDO systemctl restart "$SERVICE_NAME"
+          $SUDO docker compose -f docker-compose.yml ps
+          REMOTE

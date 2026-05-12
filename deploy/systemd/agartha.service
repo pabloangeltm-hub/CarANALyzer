@@ -1,0 +1,21 @@
+[Unit]
+Description=Agartha SaaS Docker Compose stack
+Documentation=https://docs.docker.com/compose/
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/agartha
+Environment=COMPOSE_PROJECT_NAME=agartha
+Environment=DOCKER_BUILDKIT=1
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecReload=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+RemainAfterExit=yes
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

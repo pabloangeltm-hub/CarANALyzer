@@ -20,6 +20,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+BLOCK_STATUS_CODES = {403, 407, 408, 409, 425, 429, 500, 502, 503, 504}
+BLOCK_TEXT_MARKERS = (
+    "datadome",
+    "captcha",
+    "access denied",
+    "request blocked",
+    "pardon our interruption",
+    "too many requests",
+)
+SCRAPINGBEE_ENDPOINT = "https://app.scrapingbee.com/api/v1/"
+BRIGHTDATA_ENDPOINT = "https://api.brightdata.com/request"
+
 # ---------------------------------------------------------------------------
 # User-Agent pool
 # ---------------------------------------------------------------------------
@@ -65,6 +77,138 @@ def get_session(proxy_url: str | None = None) -> requests.Session:
 
 
 # ---------------------------------------------------------------------------
+# Proxy fallback providers
+# ---------------------------------------------------------------------------
+
+def session_pool_count(path: str | None = None) -> int:
+    session_dir = Path(path or os.getenv("SESSION_POOL_DIR", ".tmp/sessions"))
+    return len(list(session_dir.glob("*.json"))) if session_dir.exists() else 0
+
+
+def _proxy_fallback_enabled(response: requests.Response | None = None) -> bool:
+    if os.getenv("PROXY_FALLBACK_ENABLED", "1").lower() in {"0", "false", "no"}:
+        return False
+
+    minimum = int(os.getenv("PROXY_FALLBACK_SESSION_POOL_MIN", "3"))
+    if session_pool_count() >= minimum:
+        return False
+
+    if response is None:
+        return True
+
+    if response.status_code in BLOCK_STATUS_CODES:
+        return True
+
+    sample = response.text[:2000].casefold()
+    return any(marker in sample for marker in BLOCK_TEXT_MARKERS)
+
+
+def _provider_order() -> list[str]:
+    raw = os.getenv("PROXY_FALLBACK_ORDER", "scrapingbee,brightdata")
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def _scrapingbee_fetch(url: str, method: str, timeout: int, **kwargs: Any) -> requests.Response:
+    api_key = os.getenv("SCRAPINGBEE_API_KEY")
+    if not api_key:
+        raise RuntimeError("SCRAPINGBEE_API_KEY is not configured")
+    if method.upper() != "GET":
+        raise RuntimeError("ScrapingBee fallback currently supports GET requests only")
+
+    params = {
+        "api_key": api_key,
+        "url": url,
+        "render_js": os.getenv("SCRAPINGBEE_RENDER_JS", "False"),
+    }
+    if os.getenv("SCRAPINGBEE_PREMIUM_PROXY", "1").lower() not in {"0", "false", "no"}:
+        params["premium_proxy"] = "True"
+    if country := os.getenv("SCRAPINGBEE_COUNTRY_CODE"):
+        params["country_code"] = country
+
+    headers = kwargs.get("headers")
+    return requests.get(
+        os.getenv("SCRAPINGBEE_ENDPOINT", SCRAPINGBEE_ENDPOINT),
+        params=params,
+        headers=headers,
+        timeout=timeout,
+    )
+
+
+def _response_from_brightdata(url: str, payload: dict[str, Any]) -> requests.Response:
+    response = requests.Response()
+    response.url = url
+    response.status_code = int(payload.get("status_code") or 200)
+    headers = payload.get("headers")
+    if isinstance(headers, dict):
+        response.headers.update({str(key): str(value) for key, value in headers.items()})
+    body = payload.get("body", "")
+    response._content = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+    response.encoding = requests.utils.get_encoding_from_headers(response.headers) or "utf-8"
+    return response
+
+
+def _brightdata_fetch(url: str, method: str, timeout: int, **kwargs: Any) -> requests.Response:
+    api_key = os.getenv("BRIGHTDATA_API_KEY") or os.getenv("BRIGHTDATA_KEY")
+    if not api_key:
+        raise RuntimeError("BRIGHTDATA_API_KEY/BRIGHTDATA_KEY is not configured")
+
+    payload = {
+        "zone": os.getenv("BRIGHTDATA_ZONE", "web_unlocker1"),
+        "url": url,
+        "format": "json",
+        "method": method.upper(),
+    }
+    if country := os.getenv("BRIGHTDATA_COUNTRY"):
+        payload["country"] = country
+    if kwargs.get("json") is not None:
+        payload["body"] = json.dumps(kwargs["json"], ensure_ascii=False)
+    elif kwargs.get("data") is not None:
+        payload["body"] = kwargs["data"]
+
+    api_response = requests.post(
+        os.getenv("BRIGHTDATA_ENDPOINT", BRIGHTDATA_ENDPOINT),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=timeout,
+    )
+    api_response.raise_for_status()
+    return _response_from_brightdata(url, api_response.json())
+
+
+def _fetch_with_proxy_fallback(
+    url: str,
+    method: str,
+    timeout: int,
+    **kwargs: Any,
+) -> requests.Response:
+    errors: list[str] = []
+    providers = {
+        "scrapingbee": _scrapingbee_fetch,
+        "brightdata": _brightdata_fetch,
+    }
+
+    for provider in _provider_order():
+        fetcher = providers.get(provider)
+        if fetcher is None:
+            continue
+        try:
+            print(f"  [proxy-fallback] provider={provider} url={url}")
+            response = fetcher(url, method, timeout, **kwargs)
+            if response.status_code in BLOCK_STATUS_CODES:
+                errors.append(f"{provider}: status {response.status_code}")
+                continue
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            errors.append(f"{provider}: {exc!r}")
+
+    raise RuntimeError(f"proxy fallback failed for {url}: {'; '.join(errors)}")
+
+
+# ---------------------------------------------------------------------------
 # Retry + exponential backoff
 # ---------------------------------------------------------------------------
 
@@ -94,6 +238,9 @@ def fetch(
     for attempt in range(max_retries + 1):
         try:
             response = session.request(method, url, timeout=timeout, **kwargs)
+
+            if response.status_code in BLOCK_STATUS_CODES and _proxy_fallback_enabled(response):
+                return _fetch_with_proxy_fallback(url, method, timeout, **kwargs)
 
             if response.status_code in {429, 500, 502, 503, 504}:
                 _wait(attempt, base_delay, response.status_code)
